@@ -1,4 +1,4 @@
-package com.hht.context.resource;
+package com.hht.context.io;
 
 
 import org.slf4j.Logger;
@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.function.Function;
 
 //扫描指定目录，获取某一类型的资源
+//只加载classpath下的，与绝对路径无关，如果不在classpath下则加载不到
 public class ResourceResolver {
 
     Logger logger = LoggerFactory.getLogger(getClass());

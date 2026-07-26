@@ -99,4 +99,15 @@ public class ClassUtils {
         }
         throw new BeanDefinitionException(String.format("Multiple methods with @%s found in class: %s", annoClass.getSimpleName(), clazz.getName()));
     }
+
+    /**
+     * Get non-arg method by method name. Not search in super class.
+     */
+    public static Method getNamedMethod(Class<?> clazz, String methodName) {
+        try {
+            return clazz.getDeclaredMethod(methodName);
+        } catch (ReflectiveOperationException e) {
+            throw new BeanDefinitionException(String.format("Method '%s' not found in class: %s", methodName, clazz.getName()));
+        }
+    }
 }

@@ -18,7 +18,7 @@ public class BeanDefinition implements Comparable<BeanDefinition>{
     private Object instance = null;
     // 构造方法/null:
     private final Constructor<?> constructor;
-    // 工厂方法名称/null:
+    // 工厂类名称/null:
     private final String factoryName;
     // 工厂方法/null:
     private final Method factoryMethod;
