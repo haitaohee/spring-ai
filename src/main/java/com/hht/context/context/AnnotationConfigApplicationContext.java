@@ -1,12 +1,7 @@
 package com.hht.context.context;
 
 import com.hht.context.annotation.*;
-import com.hht.context.exception.BeanCreationException;
-import com.hht.context.exception.BeanDefinitionException;
-import com.hht.context.exception.BeanNotOfRequiredTypeException;
-import com.hht.context.exception.NoSuchBeanDefinitionException;
-import com.hht.context.exception.NoUniqueBeanDefinitionException;
-import com.hht.context.exception.UnsatisfiedDependencyException;
+import com.hht.context.exception.*;
 import com.hht.context.io.PropertyResolver;
 import com.hht.context.io.ResourceResolver;
 import com.hht.context.util.ClassUtils;
@@ -17,15 +12,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.lang.annotation.Annotation;
-import java.lang.invoke.MethodHandle;
-import java.lang.reflect.AccessibleObject;
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Executable;
-import java.lang.reflect.Field;
-import java.lang.reflect.Member;
-import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
-import java.lang.reflect.Parameter;
+import java.lang.reflect.*;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -33,14 +20,16 @@ import java.util.stream.Collectors;
  * 注意：这里只实现了传入首配置类的componentscan和import扫描！！！！import注解一定要在传入的类上，componentscan可以在传入配置类的父类
  * 基本上就是只扫描启动类的这俩注解。spring是要递归的，每次扫描出来的新类上如果有componentscan和import，还会递归都扫描。
  */
-public class AnnotationConfigApplicationContext {
+public class AnnotationConfigApplicationContext implements ConfigurableApplicationContext{
 
     protected final Logger logger = LoggerFactory.getLogger(getClass());
 
     protected final PropertyResolver propertyResolver;
     protected final Map<String, BeanDefinition> beans;
 
-    private Set<String> creatingBeanNames;
+    private final Set<String> creatingBeanNames;
+
+    private final List<BeanPostProcessor> beanPostProcessors = new ArrayList<>();
 
     public AnnotationConfigApplicationContext(Class<?> configClass, PropertyResolver propertyResolver) {
         this.propertyResolver = propertyResolver;
@@ -51,14 +40,19 @@ public class AnnotationConfigApplicationContext {
         // 创建Bean的定义:
         this.beans = createBeanDefinitions(beanClassNames);
         this.creatingBeanNames = new HashSet<>();
-
+        //spring也是先configuration再普通bean
+        //todo 但是spring允许configuration Autowired其他类
         this.beans.values().stream()
             //sorted是为了按照Order注解的顺序执行创建
-            .filter(this::isConfigurationDefinition).sorted().map(def -> {
-                createBeanAsEarlySingleton(def);
-                return def.getName();
-            }).collect(Collectors.toList());
+            .filter(this::isConfigurationDefinition).sorted()
+            .forEach(this::createBeanAsEarlySingleton);
 
+        List<BeanPostProcessor> processors = this.beans.values().stream()
+            .filter(this::isBeanPostProcessorDefinition)
+            .sorted()
+            .map(def -> (BeanPostProcessor) createBeanAsEarlySingleton(def))
+            .collect(Collectors.toList());
+        this.beanPostProcessors.addAll(processors);
         // 创建其他普通Bean:
         createNormalBeans();
 
@@ -68,24 +62,40 @@ public class AnnotationConfigApplicationContext {
             });
         }
 
-        this.beans.values().forEach(def -> {
-            injectBean(def);
-        });
+        this.beans.values().forEach(this::injectBean);
 
-        this.beans.values().forEach(def -> {
-            initBean(def);
-        });
+        this.beans.values().forEach(this::initBean);
+    }
+
+    boolean isBeanPostProcessorDefinition(BeanDefinition def) {
+        return BeanPostProcessor.class.isAssignableFrom(def.getBeanClass());
     }
 
     /**
      * 注入依赖但不调用init方法
      */
     void injectBean(BeanDefinition def) {
+        //获取proxy对象的原对象
+        Object beanInstance = getProxiedInstance(def);
         try {
-            injectProperties(def, def.getBeanClass(), def.getInstance());
+            injectProperties(def, def.getBeanClass(), beanInstance);
         } catch (ReflectiveOperationException e) {
             throw new BeanCreationException(e);
         }
+    }
+
+    Object getProxiedInstance(BeanDefinition def) {
+        Object beanInstance = def.getInstance();
+        List<BeanPostProcessor> reversedBeanPostProcessors = new ArrayList<>(this.beanPostProcessors);
+        Collections.reverse(reversedBeanPostProcessors);
+        //循环倒序逆转postprocessor，恢复原对象
+        for (BeanPostProcessor processor : reversedBeanPostProcessors) {
+            Object restoredInstance = processor.postProcessOnProperty(beanInstance, def.getName());
+            if (restoredInstance != beanInstance) {
+                beanInstance = restoredInstance;
+            }
+        }
+        return beanInstance;
     }
 
     void injectProperties(BeanDefinition def, Class<?> clazz, Object bean) throws ReflectiveOperationException {
@@ -235,6 +245,14 @@ public class AnnotationConfigApplicationContext {
                 throw new BeanCreationException(
                     String.format("Cannot specify @Autowired when create @Configuration bean '%s': %s.", def.getName(), def.getBeanClass().getName()));
             }
+
+            // BeanPostProcessor不能依赖其他Bean，不允许使用@Autowired创建:
+            final boolean isBeanPostProcessor = isBeanPostProcessorDefinition(def);
+            if (isBeanPostProcessor && autowired != null) {
+                throw new BeanCreationException(
+                        String.format("Cannot specify @Autowired when create BeanPostProcessor '%s': %s.", def.getName(), def.getBeanClass().getName()));
+            }
+
             //spring对于这种处理也可能报错，看具体情况
             if (value != null && autowired != null) {
                 throw new BeanCreationException(
@@ -287,6 +305,17 @@ public class AnnotationConfigApplicationContext {
             }
         }
         def.setInstance(instance);
+
+        for (BeanPostProcessor  processor : beanPostProcessors) {
+            Object processed = processor.postProcessBeforeInitialization(def.getInstance(), def.getName());
+            if (processed == null) {
+                throw new BeanCreationException(String.format("PostBeanProcessor returns null when process bean '%s' by %s", def.getName(), processor));
+            }
+            if (def.getInstance() != processed) {
+                logger.atDebug().log("Bean '{}' was replaced by post processor {}.", def.getName(), processor.getClass().getName());
+                def.setInstance(processed);
+            }
+        }
         return def.getInstance();
     }
 
@@ -431,12 +460,71 @@ public class AnnotationConfigApplicationContext {
         return order == null ? Integer.MAX_VALUE : order.value();
     }
 
+    @Override
+    public boolean containsBean(String name) {
+        return this.beans.containsKey(name);
+    }
+
     public <T> T getBean(String name) {
         BeanDefinition def = this.beans.get(name);
         if (def == null) {
             throw new NoSuchBeanDefinitionException(String.format("No bean defined with name '%s'.", name));
         }
         return (T) def.getRequiredInstance();
+    }
+
+    /**
+     * 通过Name和Type查找Bean，不存在抛出NoSuchBeanDefinitionException，存在但与Type不匹配抛出BeanNotOfRequiredTypeException
+     */
+    @Override
+    public <T> T getBean(String name, Class<T> requiredType) {
+        T t = findBean(name, requiredType);
+        if (t == null) {
+            throw new NoSuchBeanDefinitionException(String.format("No bean defined with name '%s' and type '%s'.", name, requiredType));
+        }
+        return t;
+    }
+
+    /**
+     * 通过Type查找Beans
+     */
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> List<T> getBeans(Class<T> requiredType) {
+        List<BeanDefinition> defs = findBeanDefinitions(requiredType);
+        if (defs.isEmpty()) {
+            return List.of();
+        }
+        List<T> list = new ArrayList<>(defs.size());
+        for (var def : defs) {
+            list.add((T) def.getRequiredInstance());
+        }
+        return list;
+    }
+
+    /**
+     * 通过Type查找Bean，不存在抛出NoSuchBeanDefinitionException，存在多个但缺少唯一@Primary标注抛出NoUniqueBeanDefinitionException
+     */
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> T getBean(Class<T> requiredType) {
+        BeanDefinition def = findBeanDefinition(requiredType);
+        if (def == null) {
+            throw new NoSuchBeanDefinitionException(String.format("No bean defined with type '%s'.", requiredType));
+        }
+        return (T) def.getRequiredInstance();
+    }
+
+    @Override
+    public void close() {
+        logger.info("Closing {}...", this.getClass().getName());
+        this.beans.values().forEach(def -> {
+            final Object beanInstance = getProxiedInstance(def);
+            callMethod(beanInstance, def.getDestroyMethod(), def.getDestroyMethodName());
+        });
+        this.beans.clear();
+        logger.info("{} closed.", this.getClass().getName());
+        ApplicationContextUtils.setApplicationContext(null);
     }
 
     /**
